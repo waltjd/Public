@@ -1,0 +1,583 @@
+$vcenter = "drsite"
+$operation = $env:Operation
+$choice = $env:Choice
+$bubble = $env:bubble
+$rpsrch2 = $env:SearchString
+#$SecurePassword = $env:Password | ConvertTo-SecureString -AsPlainText -Force
+#$creds = New-Object System.Management.Automation.PSCredential -ArgumentList $env:User, $SecurePassword
+
+$VCPassword = ConvertTo-SecureString "$($ENV:vcpass)" -AsPlainText -Force
+$Creds = New-Object System.Management.Automation.PSCredential ("$ENV:vcuser", $vcPassword)
+
+
+
+##### Override SearchString above if a preset choice was made #####
+if ($choice.contains("100s")) {$rpsrch2 = "*P1*"}
+if ($choice.contains("200s")) {$rpsrch2 = "*P2*"}
+if ($choice.contains("250s")) {$rpsrch2 = "*P25*"}
+if ($choice.contains("260s")) {$rpsrch2 = "*P26*"}
+if ($choice.contains("290s")) {$rpsrch2 = "*P29*"}
+if ($choice.contains("300s")) {$rpsrch2 = "*P3*"}
+if ($choice.contains("400s")) {$rpsrch2 = "*P4*"}
+if ($choice.contains("500s")) {$rpsrch2 = "*P5*"}
+##### Set bubble from preset if selected #####
+if ($choice.contains("Bubble")) {$bubble = "True"}
+if ($bubble -eq "true"){
+	$rpsrch = "z*"
+}
+Else{
+	$rpsrch = "[0-9][0-9][0-9]-*"
+}
+
+
+##########################################
+### If Operation is CheckRecoveryPlans ###
+##########################################
+if ($Operation -eq "CheckRecoveryPlansforEmpties") {
+write-host "This script takes 90 seconds to complete...."
+$srmApi = $srm.ExtensionData
+Connect-VIServer -Server $vcenter -credential $creds 
+$srm = Connect-SrmServer -server $vcenter -credential $creds
+$srmApi = $srm.ExtensionData
+
+$recoveryplans = $srmapi.Recovery.ListPlans()
+
+foreach ($recoveryplan in $recoveryplans) {
+$thisrecoveryplansPGs = $recoveryplan.getinfo().protectiongroups
+$vmcount = 0
+
+foreach ($RPprotectionGroup in $thisrecoveryplansPGs) { 
+$vmcount = $vmcount + $rpprotectiongroup.listprotectedvms().count 
+}
+
+if ($recoveryplan.GetInfo().Name -like '*-empty' -and $vmcount -gt 0) {write-host $recoveryplan.GetInfo().Name "Listed as Empty, but has VMs, you need to remove the -empty"; $errors++}
+if ($recoveryplan.GetInfo().Name -notlike '*-empty' -and $vmcount -eq 0) {write-host $recoveryplan.GetInfo().Name "Has no VMs, but is not labeled with -empty, you need to add -empty"; $errors++}
+}
+write-host "SUMMARY:"
+if ($errors -eq $null) {write-host "No naming problems with Recovery plans, you are ready to proceed!!!"}
+if ($errors -gt 0) {write-host "You have" $errors "Recovery Plan naming issues, these MUST be fixed before running your test"}
+
+}
+
+
+
+#############################################
+### If Operation is CheckProtectionGroups ###
+#############################################
+if ($Operation -eq "CheckProtectionGroups") {
+connect-viserver drvcenter -Credential $creds
+Function Connect-SRMPair {
+	
+	Write-host “Connecting to local SRM server..” -ForegroundColor DarkCyan
+	if (Connect-SrmServer -Credential $Creds) {
+		Write-host “Connecting to remote SRM server..” -ForegroundColor DarkCyan
+		$DefaultSrmServers.extensiondata.LoginRemoteSite($Creds.username,
+		$Creds.GetNetworkCredential().password,$null)
+	}
+}
+connect-srmpair
+$srmapi = $DefaultSrmServers.extensiondata
+$protectionGroups = $srmApi.Protection.ListProtectionGroups()
+$listofvms = $protectionGroups.checkconfigured() |out-string
+if ($listofvms -match 'False') {write-host "You have one or more errors in protection groups, SRM is NOT ready to run!!!"}
+else {write-host "All protection groups are GOOD, SRM is ready to run!"}
+disconnect-srmserver -Confirm:$false
+}
+
+
+###########################################
+### If Operation is Set OPS Perms Allow ###
+###########################################
+if ($Operation -eq "SetOPSPermsToPowerUser") {
+Connect-VIServer $vcenter -Credential $creds
+Get-VIPermission -Entity 'Datacenters' | where {$_.Principal -eq "domain\ADsecurityGroup"} | Set-VIPermission -Role (Get-VIRole -Name "VirtualMachinePowerUser")
+}
+
+
+
+#####################################
+### If Operation is mount storage ###
+#####################################
+if ($Operation -eq "MountStorage") {
+Connect-VIServer $vcenter -Credential $creds
+
+if ($DefaultVIServer -eq $null){
+	Write-Host "Not Connected to vCenter, Bad username or password?"
+	break
+	}
+$srm = Connect-SrmServer -Credential $creds
+$srmApi = $srm.ExtensionData
+
+$RPmode = [VMware.VimAutomation.Srm.Views.SrmRecoveryPlanRecoveryMode]::Test
+$rpOpt = New-Object VMware.VimAutomation.Srm.Views.SrmRecoveryOptions
+$rpOpt.SyncData = $False
+
+$rplans = $srmApi.Recovery.ListPlans()
+$rplans = $rplans.getinfo() | sort -Property name
+
+Write-Host "The following Recovery plans will be started:"
+foreach ($rplan in $rplans){
+	$storagemounted = 0
+	if ($rplan.name -like $rpsrch -and $rplan.name -like $rpsrch2 -and $rplan.name -notlike "*EMPTY*" -and $rplan.State -eq "Ready"){
+		$rplan.name
+	}
+}
+foreach ($rplan in $rplans){
+	$storagemounted = 0
+	if ($rplan.name -like $rpsrch -and $rplan.name -like $rpsrch2 -and $rplan.name -notlike "*EMPTY*" -and $rplan.State -eq "Ready"){
+		#Now that we have indentified the plan to start a test on from the info for the plan
+		#We need to get a matching object for the plan so we can start the recovery
+		$rps = $srmApi.Recovery.ListPlans()
+		foreach ($rp in $rps){
+			$rpinfo = $rp.getinfo()
+			if ($rpinfo.name -eq $rplan.Name){
+				write-host "Starting recovery plan: " $rplan.name
+				#Track the time we started the test.
+				$starttime = Get-Date
+				$rp.start($RPmode,$rpOpt)
+				
+				#Find a host that is in the cluter this plan is running against.
+				$clusident = $rplan.name.split("-") | where {$_ -like "CL*"} 
+				$currhost = Get-Cluster | where {$_.name -like "*$clusident*"} | Get-VMHost
+				$currhost = $currhost[0]
+				#Loop through the current tasks looking for a Rescan on a host in this cluster that is newer than our start time.
+				$count = 0
+				while($storagemounted -eq 0){
+					$count ++
+					Write-Host "Waiting for storage to mount."
+					Start-Sleep -Seconds 5
+					$tasks = Get-Task | where {$_.name -eq "RescanAllHba"}
+					foreach ($task in $tasks){
+						if ($task.ObjectId -eq $currhost.Id -and $task.StartTime -gt $starttime){
+							$storagemounted = 1
+						}
+					}
+					if ($count -gt 60){
+						$storagemounted = 1
+					}
+				}
+				Write-Host ""					
+			}
+		}
+	}
+}
+disconnect-srmserver -Confirm:$false
+}
+#####################################
+### If Operation is Set Perennial ###
+#####################################
+if ($Operation -eq "SetPerennial") {
+
+$targetclusters = "scrubbedclustername"
+$maxthreads = 8
+Connect-VIServer $vcenter -Credential $creds
+if ($DefaultVIServer -eq $null){
+	Write-Host "Not Connected to vCenter, Bad username or password?"
+	break
+	}
+
+$currentPath = (Split-Path -parent $MyInvocation.MyCommand.Definition)
+$session = $global:DefaultVIServer | %{ $_.sessionsecret }
+$vmhosts = Get-VMHost -Location $targetclusters | select Name
+
+$scriptblock = {
+	param($creds,$vcenter,$vmhost)
+	connect-viserver $vcenter -Credential $creds
+	$RDMDisks = @()
+	$vmhparent = get-vmhost -Name $vmhost | select Parent
+	# get the ScsiCanonicalName for all RDMs attached to VMs.
+	$ScsiNames = Get-VM -Location $vmhparent.Parent.Name | Get-HardDisk -DiskType "RawPhysical","RawVirtual" | Select ScsiCanonicalName
+	foreach ($scsiname in $ScsiNames){
+		$RDMDisks += $scsiname.ScsiCanonicalName
+	}
+	#Remove duplicates that happen do to RDMs being adding to multiple VMs
+	$RDMDisks = $RDMDisks | select -uniq
+
+	# establish a ESXCLU session to each host in the cluster
+	$hostesxcli = Get-EsxCli -VMHost $vmhost
+
+	foreach($esxcli in $hostesxcli) {
+	    # And for each RDM Disk
+		$esxcli.VMHost.Name
+	    foreach($RDMDisk in $RDMDisks) {
+			# Check the current status of each RDM and if Not set to $true, set it.
+			# Set the configuration to "PereniallyReserved".
+			$results = $esxcli.storage.core.device.list($RDMDisk)
+			Write-Output "RDM "$RDMDisk "Parameter IsPerenniallyReserved is currently:  " $results[0].IsPerenniallyReserved
+	        if ($results[0].IsPerenniallyReserved -eq $false){	
+				Write-Output "Setting IsPerenniallyReserved to $true..."
+				$esxcli.storage.core.device.setconfig($false, ($RDMDisk), $true)
+				$results = $esxcli.storage.core.device.list($RDMDisk)
+				Write-Output "RDM "$RDMDisk "Parameter IsPerenniallyReserved is now:  " $results[0].IsPerenniallyReserved
+			}
+			else {
+				Write-Output "Skipping..."
+			}
+	    }
+	}
+}	
+
+foreach ($vmhostname in $vmhosts){
+	While (@(Get-Job -state running).count -ge $MaxThreads){
+		Start-Sleep 1
+	}
+	$vmhost = $vmhostname.name
+	Write-Host "Starting job for: " $vmhostname.name
+
+	
+	$result = start-job -scriptblock $scriptblock -argumentlist $creds,$vcenter,$vmhost  | out-null
+}
+
+While (Get-Job -State "Running") {
+     $running = Get-Job -State "Running"
+	write-host "Jobs running: " $running.count
+    Start-Sleep 5
+}
+
+#Get-Job
+write-host "Jobs completed, getting output"    
+Get-Job | Receive-Job
+Remove-Job *
+}
+################################
+### If Operation is Power On ###
+################################
+if ($Operation -eq "PowerOn") {
+Connect-VIServer $vcenter -Credential $creds
+if ($DefaultVIServer -eq $null){
+	Write-Host "Not Connected to vCenter, Bad username or password?"
+	break
+	}
+$srm = Connect-SrmServer -Credential $creds
+$srmApi = $srm.ExtensionData
+
+$rplans = $srmApi.Recovery.ListPlans()
+$rplans = $rplans.getinfo() | sort -Property name
+
+Write-Host "The following Recovery plans will be unpaused:"
+foreach ($rplan in $rplans){
+	$storagemounted = 0
+	if ($rplan.name -like $rpsrch2 -and $rplan.State -eq "Prompting"){
+		$rplan.name
+	}
+}
+foreach ($rplan in $rplans){
+	$storagemounted = 0
+	if ($rplan.name -like $rpsrch2 -and $rplan.State -eq "Prompting"){
+		#Now that we have indentified the plan to start a test on from the info for the plan
+		#We need to get a matching object for the plan so we can start the recovery
+		$rps = $srmApi.Recovery.ListPlans()
+		foreach ($rp in $rps){
+			$rpinfo = $rp.getinfo()
+			if ($rpinfo.name -eq $rplan.Name){
+				$prompt = $rp.ListPrompts()
+				if ($prompt.data -like "Pause for mounting*" -or $prompt.data -like "*RDM*" ){
+					write-host "Unpausing recovery plan: " $rplan.name
+					$rp.AnswerPrompt($prompt.key,$false,"")
+					Write-Host ""
+					Start-Sleep -Seconds 1
+				}
+				else {
+					write-host "SKIPPING recovery plan: " $rplan.name
+					Write-Host "Prompt does not match!"
+				}
+			}
+		}
+	}
+}
+disconnect-srmserver -Confirm:$false
+}
+
+
+#############################################
+### If Operation is Check P1 DCs Status ###
+#############################################
+
+if ($Operation -eq "CheckP1sDCReadyStatus"){
+$VCPassword = ConvertTo-SecureString "$($ENV:vcpass)" -AsPlainText -Force
+$Creds = New-Object System.Management.Automation.PSCredential ("$ENV:vcuser", $vcPassword)
+
+$domainPass = ConvertTo-SecureString "$($ENV:domainpassword)" -AsPlainText -Force
+$domainCreds = New-Object System.Management.Automation.PSCredential ("$ENV:domainadminuser", $domainPass)
+
+connect-viserver drvcenter -credential $creds
+
+write-host "Waiting for tools to start on scrubbeddomaincontroller....."
+wait-tools -vm scrubbeddomaincontroller -timeoutseconds 600 |out-null
+write-host "Verifying for tools started on scrubbeddomaincontroller2....."
+wait-tools -vm scrubbeddomaincontroller2 -timeoutseconds 600 |out-null
+
+write-host "Tools is started on both domain DCs..."
+write-host "Testing from domaindc2 to see if it can query a user on domaindc3...This should take about 60 seconds to complete..."
+
+$invokecommands=@'
+Get-ADUser -Server scrubbeddomaincontroller2 -Identity 'scrubbedserviceaccount'
+'@
+
+$invokecommandscommand = Invoke-VMScript –WarningAction SilentlyContinue -vm scrubbeddomaincontroller -GuestCredential $domainCreds -ScriptText $invokecommands -ScriptType:powershell
+write-host "Here is the result:"
+write-host $invokecommandscommand
+if ($invokecommandscommand -notlike '*givenname*') {write-host ""; write-host " TEST FAILED - domain DCs ARE NOT READY YET - you can rerun this test again in a few mins, or look at the console of scrubbeddomaincontroller and scrubbeddomaincontroller2 to verify they are completely up or not..."; write-host ""}
+else {write-host ""; write-host " TEST SUCCEEDED - domain DCs are ready to go!"; write-host ""}
+
+disconnect-viserver drvcenter -confirm:$false
+
+}
+
+##########################################
+### If Operation is Set OPS Perms Deny ###
+##########################################
+if ($Operation -eq "SetOPSPermsToNoAccess") {
+Connect-VIServer $vcenter -Credential $creds
+Get-VIPermission -Entity 'Datacenters' | where {$_.Principal -eq "scrubbeddomain\scrubbedsecuritygroup"} | Set-VIPermission -Role (Get-VIRole -Name "NoAccess")
+}
+
+
+############################################
+### If Operation is Power Off Everything ###
+############################################
+if ($Operation -eq "PowerOffEverything") {
+write-host "Ignore the error as is attempts to disconnect any VCs, this is just a safety!"
+Disconnect-VIServer -Server * -Force -Confirm:$false -ErrorAction SilentlyContinue |out-null 
+Connect-VIServer drvcenter -Credential $creds
+$vms = get-vm | where-object {$_.name -notlike "*NTNX*" -and $_.name -notlike 'vCLS*' -and $_.PowerState -eq 'poweredon'}
+$vmcount = $vms |measure-object |select count |ft -HideTableHeaders |out-string
+$vmcount = $vmcount.trim()
+write-host "Total VMs to shut down (Will do 100 at a time before pausing): " $vmcount
+foreach ($vm in $vms) {
+write-host "Powering off VM: " $vm.name
+stop-vm $vm -confirm:$false -runasync |out-null
+$processed++
+    $loop++
+    if ($loop -gt 100){
+        $loop = 0
+        $percentcomplete = ($processed/$vmcount).tostring("P")
+        write-host "Percent Complete: " $percentComplete
+        
+    }
+}
+Disconnect-VIServer -Server * -Force -Confirm:$false -ErrorAction SilentlyContinue |out-null 
+    }
+
+
+########################################
+### If Operation is Clean Up Nutanix ###
+########################################
+if ($Operation -eq "CleanUpNutanixClones") {
+write-host "Ignore the error as is attempts to disconnect any VCs, this is just a safety!"
+Disconnect-VIServer -Server * -Force -Confirm:$false -ErrorAction SilentlyContinue |out-null 
+Connect-VIServer DRvcenter -Credential $creds
+$vms = get-vm | where-object {$_.name -like "Nutanix-clone*" }
+
+write-host "Going to Power Off then delete the following Nutanix Clones in 10 seconds: "
+$vmsfordisplay = $vms.name |out-string
+$vmsfordisplay=$vmsfordisplay.split(' ')
+write-host $vmsfordisplay
+start-sleep -s 10
+foreach ($vm in $vms) {
+write-host "Powering off VM: " $vm.name
+stop-vm $vm -confirm:$false -runasync |out-null
+}
+write-host "Sleeping for 10 seconds before deleting the VMs"
+start-sleep -s 10
+
+foreach ($vm in $vms) {
+write-host "Deleting " $vm.name
+remove-vm $vm -deletepermanently -Confirm:$False
+    
+    }
+Disconnect-VIServer -Server * -Force -Confirm:$false -ErrorAction SilentlyContinue |out-null 
+}
+
+
+
+
+################################
+### If Operation is Clean Up ###
+################################
+if ($Operation -eq "CleanUpSRM-SQL" -or $Operation -eq "CleanUpSRM-OtherThanSQL" ) {
+Connect-VIServer $vcenter -Credential $creds
+if ($DefaultVIServer -eq $null){
+	Write-Host "Not Connected to vCenter, Bad username or password?"
+	break
+	}
+$srm = Connect-SrmServer -Credential $creds
+$srmApi = $srm.ExtensionData
+
+#Set the type of recovery to preform
+$RPmode = [VMware.VimAutomation.Srm.Views.SrmRecoveryPlanRecoveryMode]::CleanupTest
+
+$rplans = $srmApi.Recovery.ListPlans()
+$rplans = $rplans.getinfo() | sort -Property name
+if ($Operation -eq "CleanUpSRM-SQL") {$patternmatch = @('p25')}
+if ($Operation -eq "CleanUpSRM-OtherThanSQL") {$patternmatch = @('p50','p40','p30','p29','p26','p20','p10')}
+$regexValues = [string]::Join('|',$patternmatch) 
+foreach ($rplan in $rplans){
+	$storagemounted = 0
+        
+	if ($rplan.name -match $regexValues -and $rplan.State -eq "NeedsCleanup"){
+		#Now that we have indentified the plan to start a cleanup on from the info for the plan
+		#We need to get a matching object for the plan so we can start the recovery
+		$rps = $srmApi.Recovery.ListPlans()
+		foreach ($rp in $rps){
+			$rpinfo = $rp.getinfo()
+			if ($rpinfo.name -eq $rplan.Name){
+				write-host "Cleanup on recovery plan: " $rplan.name
+				$rp.start($RPmode)
+			}
+		}
+		#Track the time we started the cleanup.
+		$starttime = Get-Date
+		#Find a host that is in the cluster this plan is running against.
+		$clusident = $rplan.name.split("-") | where {$_ -like "CL*"} 
+		$currhost = Get-Cluster | where {$_.name -like "*$clusident*"} | Get-VMHost
+		$currhost = $currhost[0]
+		Write-Host -NoNewline "Waiting for storage to unmount.."
+		#Loop through the current tasks looking for a Rescan on a host in this cluster that is newer than our start time.
+		$loopcount = 0
+		while($storagemounted -eq 0){
+			$loopcount ++
+			Write-Host -NoNewline "."
+			$tasks = Get-Task | where {$_.name -eq "RescanAllHba" -or $_.name -eq "RemovePortGroup"}
+			foreach ($task in $tasks){
+				if ($task.ObjectId -eq $currhost.Id -and $task.StartTime -gt $starttime){
+					$storagemounted = 1
+				}
+			}
+			Start-Sleep -Seconds 5
+			if ($Host.UI.RawUI.KeyAvailable -and ("q" -eq $Host.UI.RawUI.ReadKey("IncludeKeyUp,NoEcho").Character)) {
+				$storagemounted = 1
+			}
+			if ($loopcount  -eq 12){
+				$storagemounted = 1
+			}
+		}
+	Write-Host ""
+	}
+}
+disconnect-srmserver -Confirm:$false
+Disconnect-VIServer -Server * -Force -Confirm:$false -ErrorAction SilentlyContinue |out-null 
+}
+
+
+##################################
+### If Operation is Backup SRM ###
+##################################
+if ($Operation -eq "BackupSRM"  ) {
+  #SRM Access using administrator@vsphere.local password
+$Password = ConvertTo-SecureString "$($ENV:vcpass)" -AsPlainText -Force
+$Creds = New-Object System.Management.Automation.PSCredential ("$ENV:vcuser", $Password)
+$passwd = $password
+
+#NAS Access using oncall svc acct
+$Passwordnas = ConvertTo-SecureString "$($ENV:passnas)" -AsPlainText -Force
+$Credsnas = New-Object System.Management.Automation.PSCredential ("$ENV:usernas", $Passwordnas)
+$passwdnas = $passwordnas
+
+#$passwd = Read-Host "Password:  " -AsSecureString
+#$creds = Get-Credential
+
+$Err = 0
+
+$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($passwd)            
+$pass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR) 
+
+$BSTRnas = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($passwdnas)            
+$passnas = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTRnas) 
+
+$srcpath = '\\scrubbedNAS\scrubbedPath\SRM-Exports'
+if(!(Test-Path -Path "srm:" )){
+	New-PSDrive -Name srm -PSProvider FileSystem -root $srcpath -Credential $credsnas |ft -AutoSize
+}
+set-location -path "srm:\"
+
+(Get-content \\scrubbedNAS\scrubbedPath\SRM-Exports\exportbase.txt) -replace 'p@ssword',$pass | Set-Content \\scrubbedNAS\scrubbedPath\SRM-Exports\exportconf.txt
+
+#$result = & 'C:\Program Files\Java\jre1.8.0_191\bin\java.exe' -jar \\scrubbedNAS\scrubbedPath\SRM-Exports\import-export-tool-8.1.1-10646916.jar export format properties \\scrubbedNAS\scrubbedPath\SRM-Exports\exportconf.txt
+###$result = & 'java.exe' -jar \\scrubbedNAS\scrubbedPath\SRM-Exports\import-export-tool-8.1.1-10646916.jar export format properties \\scrubbedNAS\scrubbedPath\SRM-Exports\exportconf.txt
+$result = & 'C:\scrubbedpath\bin\java.exe' -jar \\scrubbedNAS\scrubbedPath\SRM-Exports\import-export-tool-8.1.1-10646916.jar export format properties \\scrubbedNAS\scrubbedPath\SRM-Exports\exportconf.txt
+
+if ($result.Contains("Export ended successfully.") -ne 'True' ){
+	$Err = 1
+}
+
+#additional check to see if there is actually an export file or not - this catches an SRM issue we ran into
+$lastwrite = get-childitem -Path srm: |where {$_.name -like 'drvcenter*' -and [datetime]::now.Date -eq $_.lastwritetime.Date} 
+if ($lastwrite -eq $null) {$Err2 = 1}
+
+Remove-Item \\scrubbedNAS\scrubbedPath\SRM-Exports\exportconf.txt
+remove-psdrive -Name srm -Force
+
+if ($Err -eq 1 -or $Err2 -eq 1) {
+	$smtpServer = “scrubbedSMTPserver”
+	$msg = new-object Net.Mail.MailMessage
+	$smtp = new-object Net.Mail.SmtpClient($smtpServer)
+	$msg.From = “VirtualCenter@scrubbeddomain.com”
+	$msg.To.Add("scrubbedGroup@scrubbedDomain.com")
+	#$msg.To.Add("scrubbedIndividual@scrubbedDomain.com")
+	$msg.IsBodyHtml = 0
+  if ($err -eq 1) {$msg.Subject = "* SRM Export Failed *"}
+  if ($err2 -eq 1) {$msg.Subject = "* SRM Appliance at near is in a bad state *"}
+  if ($err -eq 1 -and $err2 -eq 1) {$msg.Subject = "* SRM Export Failed and Appliance at near is in a bad state *"}
+	$msg.Body = $result | Format-list | Out-String
+  $prettymessage = $msg.Body
+  write-host $prettymessage
+	$smtp.Send($msg)
+}
+}
+
+
+##################################
+### If Operation is Check DNS  ###
+##################################
+if ($Operation -eq "CheckDNSAfterBubbleBroughtUp"  ) {
+Connect-VIServer scrubbedDevvCenter -Credential $creds
+  $invokecommands = @'
+$report = @()
+$dcs = @"
+scrubbeddomaincontroller1 scrubbeddomainwewanttocheck.com
+scrubbeddomaincontroller2 scrubbeddomainwewanttocheck.com
+scrubbeddomaincontroller3 otherdomainwewanttocheck.int
+scrubbeddomaincontroller4 otherdomainwewanttocheck.int
+scrubbeddomaincontroller5 yetanotherdomainwewanttocheck.com
+scrubbeddomaincontroller6 yetanotherdomainwewanttocheck.com
+cooldc1.domain.int domain.int
+cooldc2.domain.int domain.int
+bardc.domain2.int domain2.int
+"@
+$dcs = ($dcs.split([environment]::newline) |where {$_ -ne ""}).trim()
+
+$targetvmineachdomain =@"
+scrubbedserver1.domain.com domain.com
+scrubbedserver2.domain2.com domain2
+scrubbedserver3.domain3.int domain3
+scrubbedserver4.domain4.int domain4.int
+scrubbedserver5.domain5.int domain5.int
+"@
+$targetvmineachdomain = ($targetvmineachdomain.split([environment]::newline) |where {$_ -ne ""}).trim()
+
+foreach ($targetvm in $targetvmineachdomain) {
+$targetvm = $targetvm.split(" ")
+foreach ($dc in $dcs) {
+$dc = $dc.split(" ")
+$prettydomain = $dc[1]
+$prettydestdomain = $targetvm[1]
+$prettydc = $dc[0]
+$prettytargetvm = $targetvm[0]
+
+$resolution = $null
+$resolution = Resolve-DnsName  -Name $targetvm[0] -Server $dc[0] 
+if ($resolution.section -ne 'Answer') {
+$report += "Testing $prettydestdomain resolution from $prettydomain failed looking for $prettytargetvm on the following DC: $prettydc`r`n  "
+}
+}
+}
+write-host "Here are the DNS issues found:"
+write-host $report
+'@
+
+write-host "Running Commands on DRchatServer"
+$invokecommandscommand = Invoke-VMScript –WarningAction SilentlyContinue -vm DRchatServer -GuestCredential $cred -ScriptText $invokecommands -ScriptType:Powershell
+Write-Host $invokecommandscommand
+Disconnect-VIServer -Server * -Force -Confirm:$false -ErrorAction SilentlyContinue |out-null 
+}
