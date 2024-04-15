@@ -1,0 +1,31 @@
+$Securepassword = $env:vcpassword | ConvertTo-SecureString -AsPlainText -Force
+$vccreds = New-Object System.Management.Automation.PSCredential -ArgumentList $env:vcuser, $SecurePassword
+$vcserver = $env:vcserver
+$cluster = $env:cluster
+$choice = $env:allorsingle
+
+Connect-VIServer $vcserver  -Credential $vccreds
+
+$newportgroups = $env:portgroups
+$newportgroups = $newportgroups.Split(",")
+write-host $newportgroups
+
+#Create list of hosts from list of clusters
+If ($choice -eq "AllClusters" ) {
+#Options for narrowing down the list if you want
+#$clusters = Get-Cluster -Server $vcserver -Location "foldername" | where {$_.ParentFolder -like "Non SRM" -or $_.ParentFolder -like "foldername" -or #$_.ParentFolder -like "Reference for SLAs"} | sort}
+$clusters = Get-Cluster -Server $vcserver
+}
+else {
+$clusters += get-cluster $cluster
+}
+
+$hosts = $clusters | get-vmhost | sort
+write-host $hosts
+
+#actually add portgroups to the list of hosts created
+foreach ($pg in $newportgroups){
+    Get-VirtualSwitch -VMHost $hosts -Name vSwitch1 | New-VirtualPortGroup -Name "VLAN-$pg" -VLanId $pg 
+write-host $pg 
+write-host $newportgroups
+}
