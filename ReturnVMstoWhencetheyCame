@@ -1,0 +1,265 @@
+<#
+This script has two options (You either scan or moveback) :
+Scan - Will scan a VC for the locations of all VMs and create a list of where all VMs are located (which host they are on) based on that VC
+-This list is stored on the Jenkins box and is named after the VC - List is sorted based on VM name so the hosts are mostly randomized.
+-You only need to scan once before you do your work.
+-Scan will not delete a previous file if it's less than 24 hours old unless you check the override box
+
+MoveBack - Will move all VMs back to where they were when the scan was made (You will need to enter the cluster info if you choose MoveBack)
+-The cluster must be entered like *c80* or *c99* or even * for everything on the VC - I didn't want to muck around with this part too much, it's up to you to enter this in the correct format
+-If you have multiple clusters, just run multiple jobs - Again, didn't want to spend the time/complexity to code for multiple clusters.
+MoveBack will not use a file over 24 hours old.
+
+How moveback works - It takes the old list of all VMs on the VC and it creates a new list of all VMs on your target cluster with memory.
+It looks at both lists and pares it down to a third list that is only VMs in your target cluster that are also not on the same host as they were on the old list
+It then sorts this new list with the biggest memory VMs first
+It then gets memory stats from each host and also counts the number of hosts that are not in maintenance mode
+It then finds the most memory used host and the least memory used host and looks at the list from top to bottom trying to find a VM than needs to move from most used host to least used host
+If it can't find a match it goes to the next highest target host, then the next.  If no matches are found  after 3 or 4 tries , then it lowers the source host by 1 and goes to each target.
+Once it finds a match, it moves the VM, waits until the move task is complete, updates the accounting for the memory, resorts the hosts, and runs the process above again.
+Eventually it will be unable to find a suitable match as it only goes through a matrix of 8-15 possible host combos depending on the number of hosts not in maint mode
+Each time it moves a VM it goes through this matrix and the matrix changes each time, so it only gives up when they are all exhausted.
+Once it can't find a match, it just goes through the list in serial fashion
+Since this script monitors the VCenter tasks and only runs one migration at a time, it's safe to do this in serial fashion once the memory matrix is complete and memory is balanced.
+#>
+
+$vcserver = $env:vc
+
+$VCPassword = ConvertTo-SecureString "$($ENV:vcpass)" -AsPlainText -Force
+$vccreds = New-Object System.Management.Automation.PSCredential ("$ENV:vcuser", $vcPassword)
+
+connect-viserver $vcserver -Credential $vccreds
+if ($env:option -eq "Scan")
+{
+#Make sure the file isn't too new before overwriting it.  Don't want to overwrite somebody else's work 
+if ((test-path -path c:\psscripts\moveback\$vcserver.csv) -eq 'True' -and ($env:scanoverwriteoverride -ne $true)) {
+$howoldisthefile = Get-Item -Path c:\psscripts\moveback\$vcserver.csv
+if ($howoldisthefile.LastWriteTime -gt (Get-Date).AddHours(-24)) {
+write-host "File for this VC already exists, and is less than 24 hours old, exiting so as to not overwrite a current file"
+write-host "Select the checkbox scanoverwriteoverride to override this safety"
+exit
+}
+
+start-sleep -s 5
+remove-item c:\psscripts\moveback\$vcserver.csv -Force -Confirm:$false
+start-sleep -s 5
+     }
+get-vm  |select name,vmhost | Export-Csv -Path c:\psscripts\moveback\$vcserver.csv -NoTypeInformation
+}
+
+if ($env:Option -eq "MoveBack") 
+{
+
+#First before moving back, make sure the file isn't too old so we don't apply an old config
+#Check the source file age and don't continue if it's over 24 hours old
+if ($env:movebackageoverride -ne $true) {
+$howoldisthefile = Get-Item -Path c:\psscripts\moveback\$vcserver.csv
+if ($howoldisthefile.LastWriteTime -lt (Get-Date).AddHours(-24)) {
+write-host "Sorry, the source file is over 24 hours old so I can't continue..."
+exit
+}
+}
+
+#Now lets get the two lists - the old one and the current one
+
+$TargetCluster = get-vmhost|  where-object {$_.Name -like $env:cluster} |select-object -First 1 
+$ParentCluster = $targetcluster |select parent |ft -HideTableHeaders |out-string
+$ParentCluster = $parentcluster.trim()
+
+$vmscurrentlocation = get-cluster $ParentCluster |Get-VM | where-object {$_.powerstate -eq 'PoweredOn' -and $_.name -notlike 'vCLS*'} |select name,memoryGB,vmhost
+$vmsoldlocation = Import-Csv -Path c:\psscripts\moveback\$vcserver.csv
+
+#We only want the VMs from our specific cluster, so I'm going to only grab stuff that has matching hosts
+$vmsoldlocationfromonlymycluster = @()
+foreach ($vm in $vmsoldlocation) {
+if ($vm.vmhost -like $env:cluster) {
+$vmsoldlocationfromonlymycluster += $vm
+}
+}
+
+#Now I have $vmscurrentlocation (Current host and memory)  and $vmsoldlocationfromonlymycluster (Their original correct host)
+
+
+#Compare the original correct list with the current list and create a list of only what needs to move:
+$listofvmsthatneedtomove = @()
+foreach ($vm in $vmscurrentlocation) {
+$Isthisvminthecorrectspot = $vmsoldlocationfromonlymycluster |where-object {$_.name -eq $vm.name}
+if ($Isthisvminthecorrectspot.VMHost -ne $vm.VMHost) {$listofvmsthatneedtomove += $vm}
+}
+
+
+
+#Sort all my vms by highest memory first since I want to move the biggest ones first if possible since I'll be moving from highest loaded host to least loaded host
+
+if ($env:SortOrder -eq 'MoveBiggestVMsFirst') {
+$listofvmsthatneedtomove = $listofvmsthatneedtomove |sort-object MemoryGB -Descending
+}
+if ($env:SortOrder -eq 'MoveSmallestVMsFirst') {
+$listofvmsthatneedtomove = $listofvmsthatneedtomove |sort-object MemoryGB 
+}
+
+#Get the cluster name from the first host in the cluster, get the memory installed, and also get current memory stats for each host
+write-host "List of VMs that need to move: $listofvmsthatneedtomove"
+$firsthost = $listofvmsthatneedtomove |select-object -first 1 |select vmhost |ft -HideTableHeaders |out-string
+$firsthost = $firsthost.trim()
+write-host "First host: $firsthost"
+$clustername = get-vmhost  $firsthost |select parent |ft -HideTableHeaders |out-string
+$clustername = $clustername.trim()
+$clusterinfo = get-cluster $clustername | Get-VMHost |where-object {$_.connectionstate -eq 'connected'}
+$totalmemory = $clusterinfo |select-object -first 1 |select MemoryTotalGB |ft -hidetableheaders | out-string
+$totalmemory = [int]$totalmemory.trim()
+#calculate the not to exceed limit of 85% on each host
+$memorylimit = $totalmemory * $env:maxmemory
+$clusterinfo = $clusterinfo |sort-object MemoryUsageGB -Descending
+
+#You can only query memory stats every 3 mins or so.  I'll need to manually account for memory using math
+#Create a hash table with each cluster name and start with it's memory usage
+$clusterhash =@{}
+foreach ($cluster in $clusterinfo) {$clusterhash.Add($cluster.Name,$cluster.MemoryUsageGB)}
+
+#Now that I have the data I need about the cluster, I need to compile a complete list of all the moves needed from the 2 lists into one list: Name,Memory,Source,Destination
+$completelist=@()
+foreach ($vm in $listofvmsthatneedtomove) {
+
+foreach ($vmold in $vmsoldlocationfromonlymycluster) {
+$gettingdestinationhost = $vmold |where-object {$_.name -eq $vm.name}
+if ($gettingdestinationhost.name -eq $vm.name) {$destination = $vmold.vmhost
+$completelist += $vm.name + ',' + $vm.MemoryGB + ',' + $vm.vmhost + ',' + $vmold.vmhost
+}
+}
+}
+
+# From the complete list, create a stat that shows the user what will be done (How many VMs need to move and estimated time)
+
+$numberofvms = $completelist |measure-object -line |ft -HideTableHeaders |out-string; $numberofvms = $numberofvms.trim()
+foreach ($line in $listofvmsthatneedtomove) {$totalmemoryneedingtomove += $line.MemoryGB}
+$timeneeded = ($totalmemoryneedingtomove *1.4)/60
+write-host "$numberofvms VMs are not on the correct host and it will take approximately $timeneeded minutes to complete moving them."
+
+# Now I have all the info I need in 2 lists:
+# 1) $completelist - All VMs that aren't on their original host - name, Memory, Current location, Final destination 
+# 2) $clusterhash - Editable hash table with all hosts in the cluster and their starting memory usage
+
+#Each item in completelist is just a counter, I'm not using the items
+foreach ($item in $completelist) {
+#Refresh the dictionary from the hash I adjusted accounting on at the end of this loop
+#Hash pulls from the host stats of memory
+#Hash is converted to dictionary for sorting (can't sort a hash as it's one item)
+#dictionary is used to get memory stats for potential moves
+#Move occurs
+#Hash is updated with the new accounting - memory added to target and removed from source
+#Cycle repeats
+if ($switchmode -ne 1) {
+$clusterdictionary = $clusterhash.GetEnumerator() |sort value -Descending 
+
+$numberofhosts = $clusterdictionary |measure-object -line 
+$highnumber = $numberofhosts.Lines / $numberofhosts.Lines -1
+$lownumber = $numberofhosts.Lines  -1
+
+$highestmemoryusagenode = $clusterdictionary[$highnumber] 
+$lowestmemoryusagenode = $clusterdictionary[$lownumber] 
+
+$highestmemoryusagenodefordisplay = $highestmemoryusagenode |out-string
+$lowestmemoryusagenodefordisplay = $lowestmemoryusagenode |out-string
+write-host ''
+write-host "Need to find something from $highestmemoryusagenodefordisplay to $lowestmemoryusagenodefordisplay"
+#go through the complete list until I find a VM that has the highest memory as the source and the lowest as the destination
+$actualtarget = $null
+$found = $null
+do
+{
+
+foreach ($potentialtarget in $completelist) {
+if (   (($potentialtarget.split(','))[2]) -eq $highestmemoryusagenode.name -and (($potentialtarget.split(','))[3]) -eq $lowestmemoryusagenode.name) {$actualtarget = $potentialtarget; $found = 1;break;}
+}
+
+#write-host "High Number is $highnumber and low number is $lownumber"
+if ($lownumber -gt ($highnumber+2)) {
+$lownumber = $lownumber -1
+}
+else {
+$highnumber = $highnumber +1
+$lownumber = $numberofhosts.Lines  -1
+}
+
+$highestmemoryusagenode = $clusterdictionary[$highnumber] 
+$lowestmemoryusagenode = $clusterdictionary[$lownumber] 
+
+
+
+} until ($found -eq 1 -or $highnumber -eq 3)
+
+
+
+
+if ($actualtarget -eq $null -and $switchmode -ne 1) {
+
+$remainingVMs = $completelist|measure-object -line |select lines |ft -hidetableheaders |  out-string
+$remainingVMs = $remainingVMs.trim()
+write-host "Started with $numberofvms VMs and after memory balancing we are down to $remainingVMs VMs"
+write-host "Will move the remaining VMs using conventional methods..."
+$switchmode = 1
+}
+
+}
+if ($switchmode -eq 1) {
+    $actualtarget = $completelist[0]
+    $remainingVMs = $completelist|measure-object -line |select lines |ft -hidetableheaders |  out-string
+$remainingVMs = $remainingVMs.trim()
+write-host "$remainingVMs VMs remaining"
+}
+#Make sure moving the actual target to the destination won't exceed 85% memory
+
+if (([int]($actualtarget.split(','))[1]) + $lowestmemoryusagenode.value -gt $memorylimit) {
+$overrunvm = (($actualtarget.split(','))[0])
+$overrunvmmem =(($actualtarget.split(','))[1])
+$overruntarget=(($actualtarget.split(','))[3])
+$overrunamount=([int]($actualtarget.split(','))[1]) + $lowestmemoryusagenode.value
+$overrunpercent = ($overrunamount/$totalmemory).tostring("P")
+write-host "Overrunning $overruntarget by trying to move $overrunvm with $overrunvmmem GB of RAM.  This would result in RAM usage of $overrunamount out of $totalmemory or $overrunpercent which exceeds the limit of $env:maxmemory"
+break
+} 
+
+#It doesn't overrun the cluster so let's go ahead and proceed...
+$vmtomove = $null; $sourcehost =$null; $targethost = $null
+$vmtomove = (($actualtarget.split(','))[0])
+$vmmem =(($actualtarget.split(','))[1])
+$sourcehost = (($actualtarget.split(','))[2])
+$targethost = (($actualtarget.split(','))[3]) |Out-String
+$targethost = $targethost.trim()
+
+write-host "Moving $vmtomove with $vmmem GB memory from $sourcehost to $targethost"
+$remainingVMs = $completelist|measure-object -line |select lines |ft -hidetableheaders |  out-string
+write-host "$remainingVMs VMs remaining to move"
+if ($env:simulation -ne $true) {
+$task = Move-VM -VM $vmtomove -Destination $targethost -runasync
+while($task.ExtensionData.Info.State -eq "running"){
+  #$task | select @{N="Progress";E={$_.ExtensionData.Info.Progress}}
+  $task.ExtensionData.UpdateViewData("Info.State","Info.Progress")
+}
+}
+
+
+
+#Update accounting
+#Remove memory from source host
+$clusterhash[$targethost] +=([int]($actualtarget.split(','))[1])
+#Add memory to target host
+$clusterhash[$sourcehost] -=([int]($actualtarget.split(','))[1])
+
+#Remove the VM we just worked on by only copying the VMs not worked on to a new array then copying the new array to our current array
+$tempcompletelist=@()
+foreach ($lineitem in $completelist) {
+if (   (($lineitem.split(','))[0]) -ne $vmtomove ) {$tempcompletelist += $lineitem }
+}
+$completelist = $tempcompletelist
+
+#$completelist |Measure-Object -Line
+$clusterdictionaryfordisplay = $clusterdictionary |out-string 
+if ($switchmode -ne 1) {write-host $clusterdictionaryfordisplay}
+
+} #end of for each item
+if ($env:simulation -eq $true) {write-host "No memory issues were found, feel free to run me without simulation mode"}
+if ($env:simulation -ne $true) {write-host "All migrations complete!"}
+
+}
